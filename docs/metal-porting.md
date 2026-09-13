@@ -292,7 +292,7 @@ descriptions, barriers, or command submission.
 ## Deliberate scope
 
 The port must preserve the existing API's multiple general queues, independent command pools,
-and externally synchronized queue operations. It adds no public sparse resources, ray tracing, task shaders, command graphs,
+and externally synchronized queue operations. It adds no public sparse resources, ray tracing, command graphs,
 queries, pipeline cache, transient-alias activation, or legacy Metal path. Such features need their
 own cross-backend contracts rather than Metal-only escape hatches.
 

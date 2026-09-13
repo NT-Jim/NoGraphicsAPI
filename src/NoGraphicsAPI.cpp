@@ -380,6 +380,7 @@ constexpr VkPipelineStageFlags2 to_vk(Stage stages)
     if (has_flag(stages, Stage::indirect)) result |= VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
     if (has_flag(stages, Stage::index_input)) result |= VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT;
     if (has_flag(stages, Stage::vertex)) result |= VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    if (has_flag(stages, Stage::task)) result |= VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT;
     if (has_flag(stages, Stage::mesh)) result |= VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT;
     if (has_flag(stages, Stage::depth_stencil_tests)) result |= VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
     if (has_flag(stages, Stage::fragment)) result |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
@@ -392,6 +393,7 @@ constexpr VkPipelineStageFlags2 to_vk(Stage stages)
 }
 
 static_assert(to_vk(Stage::all_commands) == VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+static_assert(to_vk(Stage::task) == VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT);
 static_assert(to_vk(Stage::all_commands | Stage::host) ==
               (VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT));
 
@@ -414,7 +416,7 @@ VkAccessFlags2 to_vk(Access accesses)
 }
 
 constexpr VkBufferUsageFlags universal_buffer_usage =
-    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
     VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
@@ -438,8 +440,7 @@ bool is_usable_memory_type(const VkPhysicalDeviceMemoryProperties& properties, u
 }
 
 constexpr VkAddressCommandFlagsKHR address_flags =
-    VK_ADDRESS_COMMAND_FULLY_BOUND_BIT_KHR |
-    VK_ADDRESS_COMMAND_STORAGE_BUFFER_USAGE_BIT_KHR;
+    VK_ADDRESS_COMMAND_FULLY_BOUND_BIT_KHR;
 } // namespace
 
 namespace detail
@@ -1732,6 +1733,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     enabled_features.address_commands.deviceAddressCommands = VK_TRUE;
     enabled_features.untyped_pointers.shaderUntypedPointers = VK_TRUE;
     enabled_features.unified_image_layouts.unifiedImageLayouts = selected.unified_image_layouts ? VK_TRUE : VK_FALSE;
+    enabled_features.mesh_shader.taskShader = VK_TRUE;
     enabled_features.mesh_shader.meshShader = VK_TRUE;
     enabled_features.swapchain_maintenance1.swapchainMaintenance1 = VK_TRUE;
 
@@ -2597,12 +2599,18 @@ namespace
 {
 
 PSO* create_raster_pso(Device* device, Span<const uint32> first_stage_spirv, Span<const uint32> fragment_spirv, Span<const ColorTargetDesc> color_targets,
-                       Format depth_format, Format stencil_format, const RasterizationState& rasterization_state, bool mesh) noexcept
+                       Format depth_format, Format stencil_format, const RasterizationState& rasterization_state,
+                       bool mesh, Span<const uint32> task_spirv = {}) noexcept
 {
     assert(device && "PSO creation called with a null device");
     assert((color_targets.size == 0 || color_targets.data) && color_targets.size <= max_color_attachments &&
            "color targets must fit the wrapper's attachment array");
 
+    const VkShaderModuleCreateInfo task_module_info{
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = task_spirv.size * sizeof(uint32),
+        .pCode = task_spirv.data,
+    };
     const VkShaderModuleCreateInfo first_stage_module_info{
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = first_stage_spirv.size * sizeof(uint32),
@@ -2614,6 +2622,12 @@ PSO* create_raster_pso(Device* device, Span<const uint32> first_stage_spirv, Spa
         .pCode = fragment_spirv.data,
     };
     const VkPipelineShaderStageCreateInfo stages[]{
+        VkPipelineShaderStageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = &task_module_info,
+            .stage = VK_SHADER_STAGE_TASK_BIT_EXT,
+            .pName = "taskMain",
+        },
         VkPipelineShaderStageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .pNext = &first_stage_module_info,
@@ -2714,8 +2728,8 @@ PSO* create_raster_pso(Device* device, Span<const uint32> first_stage_spirv, Spa
     const VkGraphicsPipelineCreateInfo pso_info{
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = &flags_info,
-        .stageCount = fragment_spirv.size ? 2u : 1u,
-        .pStages = stages,
+        .stageCount = 1u + (task_spirv.size ? 1u : 0u) + (fragment_spirv.size ? 1u : 0u),
+        .pStages = stages + (task_spirv.size ? 0u : 1u),
         .pVertexInputState = mesh ? nullptr : &vertex_input,
         .pInputAssemblyState = mesh ? nullptr : &input_assembly,
         .pViewportState = &viewport_state,
@@ -2745,7 +2759,7 @@ PSO* create_graphics_pso(Device* device, const GraphicsPSODesc& desc) noexcept
 PSO* create_mesh_pso(Device* device, const MeshPSODesc& desc) noexcept
 {
     return create_raster_pso(device, desc.mesh_spirv, desc.fragment_spirv, desc.color_targets, desc.depth_format,
-                             desc.stencil_format, desc.rasterization, true);
+                             desc.stencil_format, desc.rasterization, true, desc.task_spirv);
 }
 
 PSO* create_compute_pso(Device* device, Span<const uint32> compute_spirv) noexcept

@@ -18,22 +18,14 @@ add_executable(test_upload_queue ../utility/tests/upload_queue_test.cpp)
 NoGraphicsAPI_disable_exceptions(test_upload_queue)
 target_link_libraries(test_upload_queue PRIVATE NoGraphicsAPIUtility::uploads)
 if(NOT COMMAND NoGraphicsAPI_compile_slang)
-    find_program(NOGRAPHICSAPI_SLANGC NAMES slangc)
-    find_program(NOGRAPHICSAPI_SPIRV_VAL NAMES spirv-val)
-    if(NOGRAPHICSAPI_SLANGC AND NOGRAPHICSAPI_SPIRV_VAL)
-        include(${PROJECT_SOURCE_DIR}/examples/NoGraphicsAPI_slang.cmake)
-    endif()
+    include(${PROJECT_SOURCE_DIR}/examples/NoGraphicsAPI_slang.cmake)
 endif()
-if(COMMAND NoGraphicsAPI_compile_slang)
-    set(upload_queue_shader ${CMAKE_CURRENT_SOURCE_DIR}/shaders/upload_queue.slang)
-    set(upload_queue_spv ${CMAKE_CURRENT_BINARY_DIR}/shaders/upload_queue.comp.spv)
-    NoGraphicsAPI_compile_slang(${upload_queue_spv} ${upload_queue_shader} computeMain compute
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/upload_queue_shared.h)
-    target_sources(test_upload_queue PRIVATE ${upload_queue_spv})
-    target_compile_definitions(test_upload_queue PRIVATE NOGRAPHICSAPI_UPLOAD_QUEUE_SPV_PATH="${upload_queue_spv}")
-else()
-    message(STATUS "Upload queue compute coverage omitted: Slang and spirv-val were not found; transfer tests remain enabled")
-endif()
+set(upload_queue_shader ${CMAKE_CURRENT_SOURCE_DIR}/shaders/upload_queue.slang)
+set(upload_queue_spv ${CMAKE_CURRENT_BINARY_DIR}/shaders/upload_queue.comp.spv)
+NoGraphicsAPI_compile_slang(${upload_queue_spv} ${upload_queue_shader} computeMain compute
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/upload_queue_shared.h)
+target_sources(test_upload_queue PRIVATE ${upload_queue_spv})
+target_compile_definitions(test_upload_queue PRIVATE NOGRAPHICSAPI_UPLOAD_QUEUE_SPV_PATH="${upload_queue_spv}")
 add_test(NAME test_upload_queue COMMAND test_upload_queue)
 set_tests_properties(test_upload_queue PROPERTIES
     SKIP_RETURN_CODE 77 TIMEOUT 60 FAIL_REGULAR_EXPRESSION "NoGraphicsAPI validation:")
@@ -67,7 +59,7 @@ add_test(NAME test_multithreading COMMAND test_multithreading)
 add_test(NAME test_multiple_queues COMMAND test_multithreading --multiple-queues)
 
 set_tests_properties(test_command_context test_placed_texture test_multithreading test_multiple_queues PROPERTIES
-    SKIP_RETURN_CODE 77 TIMEOUT 60 FAIL_REGULAR_EXPRESSION "NoGraphicsAPI validation:")
+    SKIP_RETURN_CODE 77 TIMEOUT 60 FAIL_REGULAR_EXPRESSION "Validation Error;NoGraphicsAPI validation:")
 
 if(WIN32)
     add_executable(test_presentation presentation_test.cpp)
@@ -77,3 +69,22 @@ if(WIN32)
     set_tests_properties(test_presentation PROPERTIES
         SKIP_RETURN_CODE 77 TIMEOUT 60 FAIL_REGULAR_EXPRESSION "NoGraphicsAPI validation:")
 endif()
+
+set(task_shader_spv ${CMAKE_CURRENT_BINARY_DIR}/shaders/task_shader.task.spv)
+set(task_mesh_spv ${CMAKE_CURRENT_BINARY_DIR}/shaders/task_mesh.mesh.spv)
+set(task_fragment_spv ${CMAKE_CURRENT_BINARY_DIR}/shaders/task_mesh.frag.spv)
+NoGraphicsAPI_compile_slang(${task_shader_spv} ${CMAKE_CURRENT_SOURCE_DIR}/task_shader.slang taskMain amplification
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/task_shader_shared.h ${CMAKE_CURRENT_SOURCE_DIR}/task_shader_common.h)
+NoGraphicsAPI_compile_slang(${task_mesh_spv} ${CMAKE_CURRENT_SOURCE_DIR}/task_mesh.slang meshMain mesh
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/task_mesh_shared.h ${CMAKE_CURRENT_SOURCE_DIR}/task_shader_common.h)
+NoGraphicsAPI_compile_slang(${task_fragment_spv} ${CMAKE_CURRENT_SOURCE_DIR}/task_mesh.slang fragmentMain fragment
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/task_mesh_shared.h ${CMAKE_CURRENT_SOURCE_DIR}/task_shader_common.h)
+add_executable(test_task_shader task_shader_test.cpp ${task_shader_spv} ${task_mesh_spv} ${task_fragment_spv})
+NoGraphicsAPI_disable_exceptions(test_task_shader)
+target_link_libraries(test_task_shader PRIVATE NoGraphicsAPI::NoGraphicsAPI NoGraphicsAPIUtility::types)
+target_compile_definitions(test_task_shader PRIVATE
+    NOGRAPHICSAPI_TASK_TEST_TASK_SPV="${task_shader_spv}"
+    NOGRAPHICSAPI_TASK_TEST_MESH_SPV="${task_mesh_spv}"
+    NOGRAPHICSAPI_TASK_TEST_FRAGMENT_SPV="${task_fragment_spv}")
+add_test(NAME test_task_shader COMMAND test_task_shader)
+set_tests_properties(test_task_shader PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60 FAIL_REGULAR_EXPRESSION "Validation Error;NoGraphicsAPI validation:")
