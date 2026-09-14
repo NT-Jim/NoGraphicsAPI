@@ -120,7 +120,6 @@ enum class Format : uint8
     rgba16_uint,
     r32_uint,
     rg32_uint,
-    rgb32_uint,
     rgba32_uint,
 
     r16_float,
@@ -128,7 +127,6 @@ enum class Format : uint8
     rgba16_float,
     r32_float,
     rg32_float,
-    rgb32_float,
     rgba32_float,
 
     rgb10a2_unorm,
@@ -224,12 +222,6 @@ struct TextureFormatInfo
             .bytes_per_block = 8,
             .depth = format == Format::d32_float_s8_uint,
             .stencil = format == Format::d32_float_s8_uint,
-        };
-    case Format::rgb32_uint:
-    case Format::rgb32_float:
-        return {
-            .block_extent = {.x = 1, .y = 1},
-            .bytes_per_block = 12,
         };
     case Format::rgba32_uint:
     case Format::rgba32_float:

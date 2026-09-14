@@ -180,14 +180,12 @@ VkFormat to_vk(Format format)
     case Format::rgba16_uint: return VK_FORMAT_R16G16B16A16_UINT;
     case Format::r32_uint: return VK_FORMAT_R32_UINT;
     case Format::rg32_uint: return VK_FORMAT_R32G32_UINT;
-    case Format::rgb32_uint: return VK_FORMAT_R32G32B32_UINT;
     case Format::rgba32_uint: return VK_FORMAT_R32G32B32A32_UINT;
     case Format::r16_float: return VK_FORMAT_R16_SFLOAT;
     case Format::rg16_float: return VK_FORMAT_R16G16_SFLOAT;
     case Format::rgba16_float: return VK_FORMAT_R16G16B16A16_SFLOAT;
     case Format::r32_float: return VK_FORMAT_R32_SFLOAT;
     case Format::rg32_float: return VK_FORMAT_R32G32_SFLOAT;
-    case Format::rgb32_float: return VK_FORMAT_R32G32B32_SFLOAT;
     case Format::rgba32_float: return VK_FORMAT_R32G32B32A32_SFLOAT;
     case Format::rgb10a2_unorm: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     case Format::rg11b10_float: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
