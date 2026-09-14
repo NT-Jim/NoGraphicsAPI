@@ -651,6 +651,18 @@ struct RenderingDesc
     StencilAttachment stencil = {};
 };
 
+enum class RenderingFlags : uint32
+{
+    none = 0,
+    suspending = 2,
+    resuming = 4,
+};
+
+constexpr RenderingFlags operator|(RenderingFlags lhs, RenderingFlags rhs) noexcept
+{
+    return static_cast<RenderingFlags>(static_cast<uint32>(lhs) | static_cast<uint32>(rhs));
+}
+
 // Rendering and raster PSOs accept at most eight color attachments. A render pass needs at least one attachment to infer its area.
 // All resource destruction is immediate. Destroy resources only when no recorded or executing GPU frame uses them.
 // The optional NoGraphicsAPIUtility DeleteQueue can defer destruction until a submitted frame completes.
@@ -671,7 +683,8 @@ void destroy_timeline_semaphore(TimelineSemaphore* semaphore) noexcept;
 void wait_timeline(TimelinePoint point) noexcept;
 void wait_idle(Device* device) noexcept;
 
-// Acquire outside a render pass. Only this command buffer may access the returned image; end_commands prepares it for presentation.
+// Acquire outside a render pass. Later buffers in the same presentation submission may also access the returned image.
+// submit_and_present prepares the image for presentation after all submitted buffers.
 // Empty while the drawable extent is zero. A nonempty acquire must be submitted with submit_and_present on queue zero.
 [[nodiscard]] SwapchainFrame acquire(CommandBuffer* commands) noexcept;
 void submit_and_present(Device* device, const SubmitDesc& desc) noexcept;
@@ -734,10 +747,13 @@ void barrier(CommandBuffer* commands, Stage before, Access before_access, Stage 
 
 // Up to DeviceDesc::timestamp_query_count markers per command buffer. stage must map to a single GPU pipeline stage.
 // Destinations must be 8-byte aligned and distinct until submission completes.
-// Results are copied at command-buffer end; read mapped readback memory only after submission completes.
+// Results are available after submission completes; only then read mapped readback memory.
 void write_timestamp(CommandBuffer* commands, uint64* gpu_destination, Stage stage = Stage::all_commands) noexcept;
 
-void begin_render_pass(CommandBuffer* commands, const RenderingDesc& desc) noexcept;
+// Each segment needs matching attachments, load/store operations, and clear values, and its own begin/end_render_pass pair.
+// Submit the complete suspend/resume chain in order in one batch. No action or synchronization commands may occur between segments.
+// Resuming skips load/clear operations; suspending defers store operations. Command-buffer bindings are not inherited.
+void begin_render_pass(CommandBuffer* commands, const RenderingDesc& desc, RenderingFlags flags = RenderingFlags::none) noexcept;
 void end_render_pass(CommandBuffer* commands) noexcept;
 
 // begin_render_pass resets a full render-area viewport and scissor and disables depth/stencil; these commands override those defaults until the next pass

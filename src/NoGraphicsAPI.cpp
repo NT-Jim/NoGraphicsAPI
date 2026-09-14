@@ -567,11 +567,15 @@ struct CommandBuffer
 {
     Device* state = nullptr;
     CommandBuffer* next = nullptr;
+    VkCommandPool command_pool = VK_NULL_HANDLE;
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    VkCommandBuffer epilogue = VK_NULL_HANDLE;
     VkQueryPool timestamp_pool = VK_NULL_HANDLE;
     VkDeviceAddress* timestamp_destinations = nullptr;
     uint32 timestamp_count = 0;
     Swapchain* swapchain = nullptr;
+    bool suspending = false;
+    bool has_epilogue = false;
 };
 
 struct CommandPool
@@ -1285,6 +1289,23 @@ void record_image_barriers(VkCommandBuffer command_buffer, Span<const VkImageMem
     vkCmdPipelineBarrier2(command_buffer, &dependency);
 }
 
+void record_barrier(VkCommandBuffer command_buffer, Stage before, Access before_access, Stage after, Access after_access) noexcept
+{
+    const VkMemoryBarrier2 memory_barrier{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = to_vk(before),
+        .srcAccessMask = to_vk(before_access),
+        .dstStageMask = to_vk(after),
+        .dstAccessMask = to_vk(after_access),
+    };
+    const VkDependencyInfo dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &memory_barrier,
+    };
+    vkCmdPipelineBarrier2(command_buffer, &dependency);
+}
+
 void make_heap_bind_info(GpuRange heap, VkDeviceSize reserved_alignment, VkDeviceSize reserved_size, VkBindHeapInfoEXT& output) noexcept
 {
     const VkDeviceSize reserved_offset = align_up<VkDeviceSize>(heap.size, reserved_alignment);
@@ -1450,6 +1471,7 @@ Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, 
         features.vulkan12.scalarBlockLayout == VK_TRUE &&
         features.vulkan12.bufferDeviceAddress == VK_TRUE &&
         features.vulkan12.timelineSemaphore == VK_TRUE &&
+        features.vulkan12.hostQueryReset == VK_TRUE &&
         features.vulkan13.synchronization2 == VK_TRUE &&
         features.vulkan13.dynamicRendering == VK_TRUE &&
         features.vulkan13.maintenance4 == VK_TRUE &&
@@ -1724,6 +1746,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     enabled_features.vulkan12.shaderFloat16 = VK_TRUE;
     enabled_features.vulkan12.scalarBlockLayout = VK_TRUE;
     enabled_features.vulkan12.timelineSemaphore = VK_TRUE;
+    enabled_features.vulkan12.hostQueryReset = VK_TRUE;
     enabled_features.vulkan12.bufferDeviceAddress = VK_TRUE;
     enabled_features.vulkan13.synchronization2 = VK_TRUE;
     enabled_features.vulkan13.dynamicRendering = VK_TRUE;
@@ -2850,7 +2873,7 @@ CommandBuffer* begin_commands(CommandPool* pool) noexcept
     }
     else
     {
-        commands = new CommandBuffer{.state = pool->state};
+        commands = new CommandBuffer{.state = pool->state, .command_pool = pool->command_pool};
         const VkCommandBufferAllocateInfo allocate_info{
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .commandPool = pool->command_pool,
@@ -2881,14 +2904,38 @@ CommandBuffer* begin_commands(CommandPool* pool) noexcept
     };
     assert_vk(vkBeginCommandBuffer(commands->command_buffer, &begin_info));
     commands->timestamp_count = 0;
+    commands->suspending = false;
+    commands->has_epilogue = false;
     if (commands->timestamp_pool)
-        vkCmdResetQueryPool(commands->command_buffer, commands->timestamp_pool, 0, pool->state->timestamp_query_count);
+        vkResetQueryPool(pool->state->device, commands->timestamp_pool, 0, pool->state->timestamp_query_count);
     return commands;
 }
 
 void end_commands(CommandBuffer* commands) noexcept
 {
     assert(commands);
+    VkCommandBuffer command_buffer = commands->command_buffer;
+    if (commands->swapchain || (commands->suspending && commands->timestamp_count != 0))
+    {
+        assert_vk(vkEndCommandBuffer(command_buffer));
+        if (!commands->epilogue)
+        {
+            const VkCommandBufferAllocateInfo allocate_info{
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                .commandPool = commands->command_pool,
+                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                .commandBufferCount = 1,
+            };
+            require_vk(vkAllocateCommandBuffers(commands->state->device, &allocate_info, &commands->epilogue));
+        }
+        const VkCommandBufferBeginInfo begin_info{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        command_buffer = commands->epilogue;
+        assert_vk(vkBeginCommandBuffer(command_buffer, &begin_info));
+        commands->has_epilogue = true;
+    }
     if (commands->swapchain)
     {
         Swapchain* swapchain = commands->swapchain;
@@ -2909,7 +2956,7 @@ void end_commands(CommandBuffer* commands) noexcept
                 .layerCount = 1,
             },
         };
-        record_image_barriers(commands->command_buffer, {&barrier, 1});
+        record_image_barriers(command_buffer, {&barrier, 1});
     }
     for (uint32 timestamp = 0; timestamp < commands->timestamp_count; ++timestamp)
     {
@@ -2918,12 +2965,12 @@ void end_commands(CommandBuffer* commands) noexcept
             .size = sizeof(uint64),
             .stride = sizeof(uint64),
         };
-        commands->state->fn.cmd_copy_query_pool_results_to_memory(commands->command_buffer, commands->timestamp_pool, timestamp, 1,
+        commands->state->fn.cmd_copy_query_pool_results_to_memory(command_buffer, commands->timestamp_pool, timestamp, 1,
                                                                  &destination, address_flags, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     }
     if (commands->timestamp_count != 0)
-        barrier(commands, Stage::transfer, Access::transfer_write, Stage::host, Access::host_read);
-    assert_vk(vkEndCommandBuffer(commands->command_buffer));
+        record_barrier(command_buffer, Stage::transfer, Access::transfer_write, Stage::host, Access::host_read);
+    assert_vk(vkEndCommandBuffer(command_buffer));
 }
 
 namespace
@@ -2935,10 +2982,16 @@ void submit_commands(Device* device, const SubmitDesc& desc, uint32 queue_index,
     TimelineSemaphore* completion = desc.completion.semaphore;
     assert(completion);
     assert(desc.waits.data || desc.waits.size == 0);
-    if (desc.commands.size > queue->command_submit_capacity)
+    size_t command_count = desc.commands.size;
+    for (size_t index = 0; index < desc.commands.size; ++index)
+    {
+        assert(desc.commands.data[index]);
+        if (desc.commands.data[index]->has_epilogue) ++command_count;
+    }
+    if (command_count > queue->command_submit_capacity)
     {
         queue->command_submit_capacity = queue->command_submit_capacity == 0 ? 4 : queue->command_submit_capacity * 2;
-        if (queue->command_submit_capacity < desc.commands.size) queue->command_submit_capacity = desc.commands.size;
+        if (queue->command_submit_capacity < command_count) queue->command_submit_capacity = command_count;
         queue->command_submit_infos = static_cast<VkCommandBufferSubmitInfo*>(
             realloc(queue->command_submit_infos, queue->command_submit_capacity * sizeof(VkCommandBufferSubmitInfo)));
     }
@@ -2951,6 +3004,20 @@ void submit_commands(Device* device, const SubmitDesc& desc, uint32 queue_index,
             .commandBuffer = commands->command_buffer,
             .deviceMask = 1,
         };
+    }
+    // Deferred query copies and presentation transitions must follow every suspended/resumed segment.
+    size_t epilogue_index = desc.commands.size;
+    for (size_t index = 0; index < desc.commands.size; ++index)
+    {
+        CommandBuffer* commands = desc.commands.data[index];
+        if (commands->has_epilogue)
+        {
+            queue->command_submit_infos[epilogue_index++] = {
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+                .commandBuffer = commands->epilogue,
+                .deviceMask = 1,
+            };
+        }
     }
     const size_t wait_count = desc.waits.size + (wait_semaphore ? 1 : 0);
     if (wait_count > queue->wait_submit_capacity)
@@ -3006,7 +3073,7 @@ void submit_commands(Device* device, const SubmitDesc& desc, uint32 queue_index,
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
         .waitSemaphoreInfoCount = static_cast<uint32>(wait_count),
         .pWaitSemaphoreInfos = queue->wait_submit_infos,
-        .commandBufferInfoCount = static_cast<uint32>(desc.commands.size),
+        .commandBufferInfoCount = static_cast<uint32>(command_count),
         .pCommandBufferInfos = queue->command_submit_infos,
         .signalSemaphoreInfoCount = signal_count,
         .pSignalSemaphoreInfos = signal_infos,
@@ -3272,7 +3339,7 @@ void set_depth_stencil(CommandBuffer* commands, const DepthStencilState& state) 
     vkCmdSetStencilReference(commands->command_buffer, VK_STENCIL_FACE_BACK_BIT, state.back.reference);
 }
 
-void begin_render_pass(CommandBuffer* commands, const RenderingDesc& desc) noexcept
+void begin_render_pass(CommandBuffer* commands, const RenderingDesc& desc, RenderingFlags flags) noexcept
 {
     assert(commands && (desc.colors.size == 0 || desc.colors.data) && desc.colors.size <= max_color_attachments);
     const RenderView* area_view = desc.colors.size ? desc.colors.data[0].render_view
@@ -3324,6 +3391,7 @@ void begin_render_pass(CommandBuffer* commands, const RenderingDesc& desc) noexc
     };
     const VkRenderingInfo rendering_info{
         .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .flags = static_cast<VkRenderingFlags>(flags),
         .renderArea = {
             .extent = {.width = area_view->width, .height = area_view->height},
         },
@@ -3334,6 +3402,7 @@ void begin_render_pass(CommandBuffer* commands, const RenderingDesc& desc) noexc
         .pStencilAttachment = desc.stencil.render_view ? &stencil_attachment : nullptr,
     };
     vkCmdBeginRendering(commands->command_buffer, &rendering_info);
+    commands->suspending = (static_cast<uint32>(flags) & static_cast<uint32>(RenderingFlags::suspending)) != 0;
 
     set_viewport(commands, {.width = static_cast<float>(area_view->width), .height = static_cast<float>(area_view->height)});
     set_scissor(commands, {.width = area_view->width, .height = area_view->height});
@@ -3515,19 +3584,7 @@ void copy_texture_to_memory(CommandBuffer* commands, Texture* source, GpuRange d
 void barrier(CommandBuffer* commands, Stage before, Access before_access, Stage after, Access after_access) noexcept
 {
     assert(commands);
-    const VkMemoryBarrier2 memory_barrier{
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-        .srcStageMask = to_vk(before),
-        .srcAccessMask = to_vk(before_access),
-        .dstStageMask = to_vk(after),
-        .dstAccessMask = to_vk(after_access),
-    };
-    const VkDependencyInfo dependency{
-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .memoryBarrierCount = 1,
-        .pMemoryBarriers = &memory_barrier,
-    };
-    vkCmdPipelineBarrier2(commands->command_buffer, &dependency);
+    record_barrier(commands->command_buffer, before, before_access, after, after_access);
 }
 
 } // namespace gpu

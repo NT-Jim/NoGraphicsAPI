@@ -222,6 +222,10 @@ The public command surface maps without structural changes:
 - buffer and texture copies use native Metal copy commands;
 - command pools map to independently owned command allocators, and ended batches map to grouped queue commits.
 
+Render-pass `suspending` and `resuming` flags map to the matching `MTL4RenderEncoderOptions`. Each
+command buffer records its own begin/end pair with the same attachments; the ordered commit joins
+the segments into one pass. The Vulkan backend uses dynamic-rendering suspension/resumption for this contract.
+
 The public global barrier also remains. Metal does not expose every NoGraphicsAPI stage separately,
 so index, indirect, color-output, and depth/stencil scopes are widened to conservative Metal render
 stages. Transfer maps to the blit stage and compute maps to dispatch. Access masks determine whether

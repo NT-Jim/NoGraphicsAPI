@@ -34,7 +34,7 @@ conventional feature checked by device creation.
 | Vulkan 1.3 `synchronization2` and `dynamicRendering` | Resource-free barriers and rendering without render-pass or framebuffer objects. |
 | Core Vulkan dynamic state | Command-set viewport, scissor, and exposed depth/stencil state. |
 | Timeline semaphores | Application-visible completion points and cross-queue waits; private swapchain retirement. |
-| 64-bit graphics/compute timestamps | GPU markers resolve to application-owned GPU addresses at command-buffer end. |
+| 64-bit graphics/compute timestamps | GPU markers resolve to application-owned GPU addresses by submission completion. |
 | Shader and layout features | Scalar layout, float16, 16-bit push/storage access, draw parameters, independent blending, and formatless storage-image access. |
 | Texture features | At least BC or ASTC LDR compression; exact format and usage support remains queryable. |
 | Win32 WSI | `VK_KHR_surface`, `VK_KHR_win32_surface`, `VK_KHR_swapchain`, and the maintenance extensions listed below. |
@@ -206,6 +206,13 @@ not implied by rendering boundaries. Each `begin_render_pass()` sets a full rend
 scissor and disables depth/stencil, preventing state from leaking between passes. Applications call
 `set_viewport()`, `set_scissor()`, or `set_depth_stencil()` after beginning a pass to override those defaults.
 
+`begin_render_pass(commands, desc, flags)` accepts `RenderingFlags::suspending` and `RenderingFlags::resuming`.
+The first segment suspends, intermediate segments resume and suspend, and the last resumes and finishes.
+Each segment repeats the same rendering description and calls `end_render_pass()`. Loads/clears occur only
+at the first begin; stores occur only at the final end. Record independent command buffers concurrently,
+then submit the complete chain in order in one batch on one queue. No action commands, synchronization
+commands, or other render passes may occur between suspension and resumption. Bindings are not inherited.
+
 The raster path has empty fixed vertex input because shaders fetch through GPU pointers. Mesh PSOs
 use `VK_EXT_mesh_shader`, with task and mesh support enabled as part of the fixed device baseline.
 `MeshPSODesc::task_spirv` adds `taskMain` before `meshMain`; direct and indirect draw counts then launch
@@ -217,11 +224,12 @@ stages share the same root ABI and descriptor heaps.
 
 `write_timestamp(commands, gpu_destination)` captures a 64-bit timestamp, defaulting to `Stage::all_commands`.
 `DeviceDesc::timestamp_query_count` sets each command buffer's capacity and defaults to 256. Zero disables timestamps and their pool/storage allocation.
-Markers target distinct, 8-byte-aligned destinations. `end_commands` records copies from private query pools
-to those addresses through `vkCmdCopyQueryPoolResultsToMemoryKHR`; markers are valid inside rendering, and the copies execute outside it.
+Markers target distinct, 8-byte-aligned destinations. The backend copies private query results to those
+addresses through `vkCmdCopyQueryPoolResultsToMemoryKHR`, outside rendering and after any suspended chain.
+Markers are valid inside each rendering segment, but not between suspension and resumption.
 The backend makes copied results host-visible. Read mapped `MemoryType::readback` destinations after the submission timeline completes,
 and multiply unsigned tick differences by `DeviceCaps::timestamp_period_ns` to obtain nanoseconds. Results are published at completion;
-markers do not make results available to subsequent commands within the same recording. Timestamp storage follows command-pool reuse and destruction.
+markers do not make results available to subsequent commands within the same submission. Timestamp storage follows command-pool reuse and destruction.
 
 Command buffers are one-shot recording handles allocated from explicit command pools. End each buffer
 before submitting any subset to a selected queue. Other pools can continue recording independently.
@@ -253,8 +261,9 @@ The backend does not recycle application allocator entries or descriptor slots; 
 an intentional whole-device drain.
 
 For presentation, `acquire(commands)` returns a swapchain-owned `RenderView` and extent, or an empty frame
-while the drawable extent is zero. Only that command buffer may access the image; `end_commands()`
-records its transition back to presentation. Submit it through `submit_and_present(device, desc)`, which always uses queue zero.
+while the drawable extent is zero. Later command buffers in the same submission may also access the image.
+Submit through `submit_and_present(device, desc)`, which always uses queue zero and transitions the image
+back to presentation after all submitted command buffers.
 Windowed device creation/destruction, drawable queries, acquire, and presentation stay on the native
 message-pump thread; other work follows the threading rules above. Binary WSI semaphores remain private, while
 `VK_KHR_swapchain_maintenance1` present fences support safe reuse and swapchain replacement without

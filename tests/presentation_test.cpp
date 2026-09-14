@@ -65,16 +65,23 @@ int main()
 
     gpu::Device* device = device_init.device;
     gpu::CommandPool* present_pool = gpu::create_command_pool(device);
+    gpu::CommandPool* middle_pool = gpu::create_command_pool(device);
+    gpu::CommandPool* last_pool = gpu::create_command_pool(device);
     gpu::CommandPool* independent_pool = gpu::create_command_pool(device);
+    const gpu::GpuHeap timestamps = gpu::create_gpu_heap(device, 3 * sizeof(uint64), gpu::MemoryType::readback);
+    uint64* timestamp_cpu = reinterpret_cast<uint64*>(timestamps.range.cpu);
+    uint64* timestamp_gpu = reinterpret_cast<uint64*>(timestamps.range.gpu);
     gpu::TimelinePoint completion{.semaphore = gpu::create_timeline_semaphore(device)};
     uint32 width = 256;
     uint32 height = 192;
 
     for (uint32 frame_index = 0; frame_index != 8; ++frame_index)
     {
-        gpu::wait_timeline(completion);
         gpu::reset_command_pool(present_pool);
+        gpu::reset_command_pool(middle_pool);
+        gpu::reset_command_pool(last_pool);
         gpu::reset_command_pool(independent_pool);
+        for (uint32 index = 0; index != 3; ++index) timestamp_cpu[index] = ~uint64{0};
 
         if (frame_index == 2)
         {
@@ -120,28 +127,63 @@ int main()
         // Submit unrelated work while the presentation buffer and another independent buffer are still recording.
         ++completion.value;
         gpu::submit(device, {.commands = {first}, .completion = completion});
-        gpu::begin_render_pass(commands, {
-            .colors = {{
-                .render_view = frame.render_view,
-                .load = gpu::LoadOp::clear,
-                .clear = {.x = float(frame_index) / 8.0f, .y = 0.25f, .z = 0.5f, .w = 1.0f},
-            }},
-        });
+        const gpu::ColorAttachment colors[]{{
+            .render_view = frame.render_view,
+            .load = gpu::LoadOp::clear,
+            .clear = {.x = float(frame_index) / 8.0f, .y = 0.25f, .z = 0.5f, .w = 1.0f},
+        }};
+        const gpu::RenderingDesc rendering{.colors = colors};
+        const bool split_pass = (frame_index & 1u) != 0;
+        gpu::begin_render_pass(commands, rendering, split_pass ? gpu::RenderingFlags::suspending : gpu::RenderingFlags::none);
+        gpu::write_timestamp(commands, timestamp_gpu);
         gpu::end_render_pass(commands);
         gpu::end_commands(commands);
         gpu::end_commands(second);
         ++completion.value;
-        gpu::submit_and_present(device, {.commands = {second, commands}, .completion = completion});
+        if (split_pass)
+        {
+            // Record continuations in reverse order, using the same clear description in every segment.
+            gpu::CommandBuffer* last = gpu::begin_commands(last_pool);
+            gpu::begin_render_pass(last, rendering, gpu::RenderingFlags::resuming);
+            gpu::write_timestamp(last, timestamp_gpu + 2);
+            gpu::end_render_pass(last);
+            gpu::end_commands(last);
+
+            gpu::CommandBuffer* middle = gpu::begin_commands(middle_pool);
+            gpu::begin_render_pass(middle, rendering, gpu::RenderingFlags::resuming | gpu::RenderingFlags::suspending);
+            gpu::write_timestamp(middle, timestamp_gpu + 1);
+            gpu::end_render_pass(middle);
+            gpu::end_commands(middle);
+            gpu::submit_and_present(device, {.commands = {second, commands, middle, last}, .completion = completion});
+        }
+        else
+        {
+            gpu::submit_and_present(device, {.commands = {second, commands}, .completion = completion});
+        }
+        gpu::wait_timeline(completion);
+        CHECK(timestamp_cpu[0] != ~uint64{0});
+        if (split_pass)
+        {
+            CHECK(timestamp_cpu[1] != ~uint64{0} && timestamp_cpu[2] != ~uint64{0});
+            CHECK(timestamp_cpu[0] <= timestamp_cpu[1] && timestamp_cpu[1] <= timestamp_cpu[2]);
+        }
+        else
+        {
+            CHECK(timestamp_cpu[1] == ~uint64{0} && timestamp_cpu[2] == ~uint64{0});
+        }
     }
 
     gpu::wait_idle(device);
     gpu::destroy_command_pool(independent_pool);
+    gpu::destroy_command_pool(last_pool);
+    gpu::destroy_command_pool(middle_pool);
     gpu::destroy_command_pool(present_pool);
+    gpu::destroy_gpu_heap(timestamps);
     gpu::destroy_timeline_semaphore(completion.semaphore);
     gpu::destroy_device(device);
     CHECK(DestroyWindow(window));
     CHECK(UnregisterClassA(window_class.lpszClassName, window_class.hInstance));
     if (!failures)
-        puts("Presentation, resize, zero drawable, and independent submission checks passed.");
+        puts("Presentation, suspended rendering, timestamp readback, resize, zero drawable, and independent submission checks passed.");
     return failures ? 1 : 0;
 }

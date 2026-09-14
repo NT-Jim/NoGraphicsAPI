@@ -61,6 +61,20 @@ add_test(NAME test_multiple_queues COMMAND test_multithreading --multiple-queues
 set_tests_properties(test_command_context test_placed_texture test_multithreading test_multiple_queues PROPERTIES
     SKIP_RETURN_CODE 77 TIMEOUT 60 FAIL_REGULAR_EXPRESSION "Validation Error;NoGraphicsAPI validation:")
 
+set(continuation_vertex_spv ${CMAKE_CURRENT_BINARY_DIR}/shaders/render_continuation.vert.spv)
+set(continuation_fragment_spv ${CMAKE_CURRENT_BINARY_DIR}/shaders/render_continuation.frag.spv)
+NoGraphicsAPI_compile_slang(${continuation_vertex_spv} ${CMAKE_CURRENT_SOURCE_DIR}/render_continuation.slang vertexMain vertex)
+NoGraphicsAPI_compile_slang(${continuation_fragment_spv} ${CMAKE_CURRENT_SOURCE_DIR}/render_continuation.slang fragmentMain fragment)
+add_executable(test_render_continuation render_continuation_test.cpp ${continuation_vertex_spv} ${continuation_fragment_spv})
+NoGraphicsAPI_disable_exceptions(test_render_continuation)
+target_link_libraries(test_render_continuation PRIVATE NoGraphicsAPI::NoGraphicsAPI Threads::Threads)
+target_compile_definitions(test_render_continuation PRIVATE
+    NOGRAPHICSAPI_CONTINUATION_VERTEX_SPV="${continuation_vertex_spv}"
+    NOGRAPHICSAPI_CONTINUATION_FRAGMENT_SPV="${continuation_fragment_spv}")
+add_test(NAME test_render_continuation COMMAND test_render_continuation)
+set_tests_properties(test_render_continuation PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 60 FAIL_REGULAR_EXPRESSION "Validation Error;NoGraphicsAPI validation:")
+
 if(WIN32)
     add_executable(test_presentation presentation_test.cpp)
     NoGraphicsAPI_disable_exceptions(test_presentation)

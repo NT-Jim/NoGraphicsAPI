@@ -250,6 +250,8 @@ Each `(device, queue_index)` and command pool is externally synchronized, with o
 Resource creation and timeline waits may run concurrently; there are no device-wide locks.
 Texture creation records initialization into an explicit command buffer. End buffers before submission,
 and reset their pool after every submitted use completes. `submit_and_present(device, desc)` always uses queue zero.
+`begin_render_pass` accepts `RenderingFlags::suspending` and `resuming` to record one pass across independent
+command buffers. Each segment repeats the same attachments and has its own begin/end pair; submit the complete chain in order in one batch.
 
 Dedicated compute/transfer queue families, ray tracing, sparse memory,
 device-generated command graphs beyond the existing indirect operations, pipeline caching, MSAA, non-Win32
