@@ -206,12 +206,10 @@ not implied by rendering boundaries. Each `begin_render_pass()` sets a full rend
 scissor and disables depth/stencil, preventing state from leaking between passes. Applications call
 `set_viewport()`, `set_scissor()`, or `set_depth_stencil()` after beginning a pass to override those defaults.
 
-`begin_render_pass(commands, desc, flags)` accepts `RenderingFlags::suspending` and `RenderingFlags::resuming`.
-The first segment suspends, intermediate segments resume and suspend, and the last resumes and finishes.
-Each segment repeats the same rendering description and calls `end_render_pass()`. Loads/clears occur only
-at the first begin; stores occur only at the final end. Record independent command buffers concurrently,
-then submit the complete chain in order in one batch on one queue. No action commands, synchronization
-commands, or other render passes may occur between suspension and resumption. Bindings are not inherited.
+`RenderingFlags::suspending` and `resuming` split one pass across independently recorded command buffers.
+Each segment repeats the rendering description and has its own begin/end pair; only the first loads
+or clears, and only the last stores. Submit the full chain in order in one batch, without action
+commands, synchronization, or other passes between segments. Each buffer sets its own bindings.
 
 The raster path has empty fixed vertex input because shaders fetch through GPU pointers. Mesh PSOs
 use `VK_EXT_mesh_shader`, with task and mesh support enabled as part of the fixed device baseline.
