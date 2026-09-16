@@ -65,7 +65,7 @@ gpu::draw(commands, root, vertex_count);
 The shader reads `root.vertices[vertex_id]` and follows `root.material` directly. Larger data structures
 remain behind pointers; there is no buffer-binding step for either field.
 
-One deliberate difference from the blog: this implementation copies small root arguments per command
+One deliberate difference from the blog: this implementation copies small root arguments (up to 256 bytes) per command
 and shares them across graphics stages, rather than passing separate GPU-resident roots for each stage.
 See the [design comparison](docs/no-graphics-api-comparison.md) for the remaining differences and
 the [shader guide](docs/slang.md) for complete examples.
