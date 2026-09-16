@@ -340,6 +340,9 @@ static_assert(sizeof(gpu::TimelinePoint) == 16 && offsetof(gpu::TimelinePoint, s
               offsetof(gpu::TimelinePoint, value) == 8);
 
 constexpr gpu::DeviceCaps default_caps{};
+static_assert(default_caps.queue_count == 0 && default_caps.general_queue_count == 0 && default_caps.compute_queue_count == 0 &&
+              default_caps.copy_queue_count == 0 && default_caps.copy_texture_granularity.x == 1 &&
+              default_caps.copy_texture_granularity.y == 1 && default_caps.copy_texture_granularity.z == 1);
 static_assert(default_caps.device_name == nullptr && default_caps.max_push_data_size == 0 &&
               default_caps.texture_heap_alignment == 0 &&
               default_caps.texture_descriptor_size == 0 &&
@@ -352,6 +355,7 @@ constexpr gpu::DeviceDesc default_device_desc{};
 static_assert(default_device_desc.window == nullptr &&
               default_device_desc.swapchain_format == gpu::Format::undefined &&
               default_device_desc.desired_swapchain_image_count == 2 && default_device_desc.desired_queue_count == 1 &&
+              default_device_desc.desired_compute_queue_count == 0 && default_device_desc.desired_copy_queue_count == 0 &&
               default_device_desc.timestamp_query_count == 256);
 constexpr gpu::uint32x2 default_uint32x2{};
 static_assert(default_uint32x2.x == 0 && default_uint32x2.y == 0);
@@ -500,7 +504,7 @@ using CreateTextureFunction = gpu::Texture* (*)(gpu::CommandBuffer*, const gpu::
 using CreateDeviceFunction = gpu::DeviceInit (*)(const gpu::DeviceDesc&) noexcept;
 using GetDrawableExtentFunction = gpu::uint32x2 (*)(gpu::Device*) noexcept;
 using AcquireFunction = gpu::SwapchainFrame (*)(gpu::CommandBuffer*) noexcept;
-using CreateCommandPoolFunction = gpu::CommandPool* (*)(gpu::Device*) noexcept;
+using CreateCommandPoolFunction = gpu::CommandPool* (*)(gpu::Device*, uint32) noexcept;
 using CommandPoolFunction = void (*)(gpu::CommandPool*) noexcept;
 using BeginCommandsFunction = gpu::CommandBuffer* (*)(gpu::CommandPool*) noexcept;
 using EndCommandsFunction = void (*)(gpu::CommandBuffer*) noexcept;

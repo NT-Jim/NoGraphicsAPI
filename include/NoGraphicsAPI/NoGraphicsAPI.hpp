@@ -428,7 +428,13 @@ constexpr Access operator|(Access lhs, Access rhs) noexcept
 struct DeviceCaps
 {
     const char* device_name = nullptr;
-    uint32 queue_count = 0; // Distinct queues in one graphics + compute queue family.
+    // Flat queue indices: general first, then compute-only, then copy-only. Queue zero supports presentation.
+    uint32 queue_count = 0;
+    uint32 general_queue_count = 0;
+    uint32 compute_queue_count = 0;
+    uint32 copy_queue_count = 0;
+    // Copy-only texture offsets/extents align to these texel-block counts, except at mip edges. Zero means whole mip levels only.
+    uint32x3 copy_texture_granularity = {.x = 1, .y = 1, .z = 1};
     uint64 max_push_data_size = 0;
     // Common element size for suballocating TextureHeap storage; every SizeAlign::align divides this value.
     uint64 texture_heap_alignment = 0;
@@ -448,7 +454,10 @@ struct DeviceDesc
     void* window = nullptr;
     Format swapchain_format = Format::undefined;
     uint32 desired_swapchain_image_count = 2; // 1..8 presentation contexts.
-    uint32 desired_queue_count = 1; // Must be nonzero; capped to the selected queue family's available count.
+    // Counts are capped to each family's capacity. A nonzero request requires that kind of queue to be available.
+    uint32 desired_queue_count = 1; // General graphics + compute queues; must be nonzero.
+    uint32 desired_compute_queue_count = 0;
+    uint32 desired_copy_queue_count = 0;
     uint32 timestamp_query_count = 256; // Per command buffer; zero disables timestamps.
 };
 
@@ -719,7 +728,8 @@ void destroy_pso(PSO* pso) noexcept;
 
 // Pools retain command storage until destruction. Reset only after every submitted buffer from this pool completes; unsubmitted buffers are discarded.
 // Reset invalidates all previously returned CommandBuffer handles. Use one pool per worker and in-flight frame for independent recording/reuse.
-[[nodiscard]] CommandPool* create_command_pool(Device* device) noexcept;
+// Buffers from a pool must be submitted to the selected queue's family.
+[[nodiscard]] CommandPool* create_command_pool(Device* device, uint32 queue_index = 0) noexcept;
 void destroy_command_pool(CommandPool* pool) noexcept;
 void reset_command_pool(CommandPool* pool) noexcept;
 [[nodiscard]] CommandBuffer* begin_commands(CommandPool* pool) noexcept;
@@ -732,6 +742,7 @@ void set_texture_descriptor_heap(CommandBuffer* commands, GpuRange heap) noexcep
 void set_sampler_descriptor_heap(CommandBuffer* commands, GpuRange heap) noexcept; // Heap range must be full GpuHeap range
 
 void copy_memory(CommandBuffer* commands, GpuRange source, GpuRange destination) noexcept;
+// Depth/stencil copies require a general queue. Copy-only queues also require DeviceCaps::copy_texture_granularity alignment.
 void copy_memory_to_texture(CommandBuffer* commands, GpuRange source, Texture* destination, const TextureCopyDesc& copy = {}) noexcept;
 void copy_texture_to_memory(CommandBuffer* commands, Texture* source, GpuRange destination, const TextureCopyDesc& copy = {}) noexcept;
 

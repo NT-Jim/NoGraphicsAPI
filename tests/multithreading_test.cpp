@@ -295,11 +295,13 @@ struct QueueContext
 void submit_copies(void* argument) noexcept
 {
     QueueContext* context = static_cast<QueueContext*>(argument);
-    gpu::CommandPool* pool = gpu::create_command_pool(context->device);
+    gpu::CommandPool* pool = gpu::create_command_pool(context->device, context->index);
     gpu::TimelineSemaphore* timeline = gpu::create_timeline_semaphore(context->device);
     const gpu::GpuHeap upload = gpu::create_gpu_heap(context->device, texture_bytes);
     const gpu::GpuHeap scratch = gpu::create_gpu_heap(context->device, texture_bytes, gpu::MemoryType::gpu_only);
     const gpu::GpuHeap readback = gpu::create_gpu_heap(context->device, texture_bytes + sizeof(uint64), gpu::MemoryType::readback);
+    const gpu::DeviceCaps& caps = gpu::get_device_caps(context->device);
+    const bool timestamps = context->index < caps.general_queue_count + caps.compute_queue_count;
     for (uint32 iteration = 1; iteration <= 32; ++iteration)
     {
         for (uint32 index = 0; index != texture_bytes / sizeof(uint32); ++index)
@@ -310,12 +312,13 @@ void submit_copies(void* argument) noexcept
         gpu::barrier(commands, gpu::Stage::transfer, gpu::Access::transfer_write, gpu::Stage::transfer, gpu::Access::transfer_read);
         gpu::copy_memory(commands, gpu::gpu_range(scratch), {.gpu = readback.range.gpu, .size = texture_bytes});
         gpu::barrier(commands, gpu::Stage::transfer, gpu::Access::transfer_write, gpu::Stage::host, gpu::Access::host_read);
-        gpu::write_timestamp(commands, reinterpret_cast<uint64*>(readback.range.gpu + texture_bytes));
+        // Copy-queue timestamp resolution is covered by the manual reproducer in known-driver-issues.md.
+        if (timestamps) gpu::write_timestamp(commands, reinterpret_cast<uint64*>(readback.range.gpu + texture_bytes));
         gpu::end_commands(commands);
         gpu::submit(context->device, {.commands = {commands}, .completion = {.semaphore = timeline, .value = iteration}}, context->index);
         gpu::wait_timeline({.semaphore = timeline, .value = iteration});
         context->valid = memcmp(upload.range.cpu, readback.range.cpu, texture_bytes) == 0 && context->valid;
-        context->valid = *reinterpret_cast<const uint64*>(readback.range.cpu + texture_bytes) != ~uint64{0} && context->valid;
+        if (timestamps) context->valid = *reinterpret_cast<const uint64*>(readback.range.cpu + texture_bytes) != ~uint64{0} && context->valid;
         gpu::reset_command_pool(pool);
     }
     gpu::destroy_command_pool(pool);
@@ -325,18 +328,20 @@ void submit_copies(void* argument) noexcept
     gpu::destroy_timeline_semaphore(timeline);
 }
 
-bool test_multiple_queues(gpu::Device* device) noexcept
+bool test_multiple_queues(gpu::Device* device, bool queue_families) noexcept
 {
-    QueueContext contexts[2]{
+    QueueContext contexts[3]{
         {.device = device},
         {.device = device, .index = 1},
+        {.device = device, .index = 2},
     };
-    Thread threads[2]{{.run = submit_copies, .argument = contexts}, {.run = submit_copies, .argument = contexts + 1}};
-    bool valid = run_threads(threads);
-    valid = valid && contexts[0].valid && contexts[1].valid;
+    Thread threads[3]{{.run = submit_copies, .argument = contexts}, {.run = submit_copies, .argument = contexts + 1},
+                      {.run = submit_copies, .argument = contexts + 2}};
+    bool valid = run_threads({threads, queue_families ? 3u : 2u});
+    for (const QueueContext& context : contexts) valid = context.valid && valid;
 
     gpu::CommandPool* producer_pool = gpu::create_command_pool(device);
-    gpu::CommandPool* consumer_pool = gpu::create_command_pool(device);
+    gpu::CommandPool* consumer_pool = gpu::create_command_pool(device, 1);
     gpu::TimelineSemaphore* produced = gpu::create_timeline_semaphore(device);
     gpu::TimelineSemaphore* consumed = gpu::create_timeline_semaphore(device);
     const gpu::GpuHeap upload = gpu::create_gpu_heap(device, texture_bytes);
@@ -373,14 +378,16 @@ bool test_multiple_queues(gpu::Device* device) noexcept
 
 int main(int argc, char** argv)
 {
-    const bool multiple_queues = argc == 2 && strcmp(argv[1], "--multiple-queues") == 0;
-    const gpu::DeviceInit device_init = gpu::create_device({.desired_queue_count = 32});
+    const bool queue_families = argc == 2 && strcmp(argv[1], "--queue-families") == 0;
+    const bool multiple_queues = queue_families || (argc == 2 && strcmp(argv[1], "--multiple-queues") == 0);
+    const gpu::DeviceInit device_init = gpu::create_device({.desired_queue_count = queue_families ? 1u : 32u,
+        .desired_compute_queue_count = queue_families ? 1u : 0u, .desired_copy_queue_count = queue_families ? 1u : 0u});
     if (device_init.error == gpu::Error::unsupported)
         return 77;
     if (device_init.error != gpu::Error::none)
         return 1;
     const uint32 queue_count = gpu::get_device_caps(device_init.device).queue_count;
-    printf("Requested 32 queues; device exposes %u compatible queue(s).\n", queue_count);
+    printf("Device exposes %u queue(s).\n", queue_count);
     if (multiple_queues && queue_count < 2)
     {
         fprintf(stderr, "Multiple-queue test skipped: device exposes %u compatible queue(s); parallel recording is tested separately.\n", queue_count);
@@ -389,7 +396,7 @@ int main(int argc, char** argv)
         return 77;
     }
     const bool valid = queue_count >= 1 && queue_count <= 32 &&
-                       (multiple_queues ? test_multiple_queues(device_init.device) : test_parallel_recording(device_init.device));
+                       (multiple_queues ? test_multiple_queues(device_init.device, queue_families) : test_parallel_recording(device_init.device));
     gpu::wait_idle(device_init.device);
     gpu::destroy_device(device_init.device);
     if (!valid)

@@ -1,6 +1,8 @@
 #include <NoGraphicsAPIUtility/texture_upload.hpp>
+#include "texture_upload_tiles.hpp"
 
 #include <assert.h>
+#include <string.h>
 
 namespace gpu
 {
@@ -29,49 +31,58 @@ void upload_texture(UploadQueue& queue, Texture* destination, const TextureDesc&
     const uint64 row_bytes = uint64(columns) * format.bytes_per_block;
     const uint64 slice_bytes = row_bytes * rows;
     assert(region.extent.x && region.extent.y && slices && source.data && source.size == slice_bytes * slices);
-    for (uint32 slice = 0; slice < slices;)
+    uint32x3 granularity = queue.state_.texture_granularity;
+    if (!volume) granularity.z = 1;
+    const uint32x3 tile = detail::texture_upload_tile({.x = columns, .y = rows, .z = slices}, granularity, format.bytes_per_block, capacity);
+
+    for (uint32 slice = 0; slice < slices; slice += tile.z)
     {
         TextureCopyDesc part = region;
         part.base_slice = volume ? 0 : region.base_slice + slice;
         part.offset.z = volume ? region.offset.z + slice : 0;
-        if (slice_bytes <= capacity)
-        {
-            const uint32 count = uint32(capacity / slice_bytes < slices - slice ? capacity / slice_bytes : slices - slice);
-            part.extent.z = volume ? count : 1;
-            part.slice_count = volume ? 1 : count;
-            queue.upload_texture(destination, {source.data + slice * slice_bytes, size_t(count * slice_bytes)}, part);
-            slice += count;
-            continue;
-        }
-        part.extent.z = 1;
-        part.slice_count = 1;
-        for (uint32 row = 0; row < rows;)
+        const uint32 part_slices = tile.z < slices - slice ? tile.z : slices - slice;
+        part.extent.z = volume ? part_slices : 1;
+        part.slice_count = volume ? 1 : part_slices;
+        for (uint32 row = 0; row < rows; row += tile.y)
         {
             part.offset.y = region.offset.y + row * format.block_extent.y;
-            if (row_bytes <= capacity)
-            {
-                const uint32 count = uint32(capacity / row_bytes < rows - row ? capacity / row_bytes : rows - row);
-                part.extent.y = count * format.block_extent.y;
-                if (part.extent.y > region.extent.y - row * format.block_extent.y) part.extent.y = region.extent.y - row * format.block_extent.y;
-                queue.upload_texture(destination, {source.data + slice * slice_bytes + row * row_bytes, size_t(count * row_bytes)}, part);
-                row += count;
-                continue;
-            }
-            part.extent.y = format.block_extent.y;
+            const uint32 part_rows = tile.y < rows - row ? tile.y : rows - row;
+            part.extent.y = part_rows * format.block_extent.y;
             if (part.extent.y > region.extent.y - row * format.block_extent.y) part.extent.y = region.extent.y - row * format.block_extent.y;
-            for (uint32 column = 0; column < columns;)
+            for (uint32 column = 0; column < columns; column += tile.x)
             {
-                const uint32 count = uint32(capacity / format.bytes_per_block < columns - column ? capacity / format.bytes_per_block : columns - column);
+                const uint32 part_columns = tile.x < columns - column ? tile.x : columns - column;
                 part.offset.x = region.offset.x + column * format.block_extent.x;
-                part.extent.x = count * format.block_extent.x;
+                part.extent.x = part_columns * format.block_extent.x;
                 if (part.extent.x > region.extent.x - column * format.block_extent.x) part.extent.x = region.extent.x - column * format.block_extent.x;
-                queue.upload_texture(destination,
-                    {source.data + slice * slice_bytes + row * row_bytes + column * format.bytes_per_block, size_t(count * format.bytes_per_block)}, part);
-                column += count;
+                const uint64 packed_row_bytes = uint64(part_columns) * format.bytes_per_block;
+                const uint64 packed_slice_bytes = packed_row_bytes * part_rows;
+                const GpuCpuRange<byte> staging = queue.reserve(packed_slice_bytes * part_slices);
+                if (part_columns == columns && part_rows == rows)
+                {
+                    memcpy(staging.cpu, source.data + slice * slice_bytes, size_t(staging.size));
+                }
+                else
+                {
+                    for (uint32 z = 0; z < part_slices; ++z)
+                    {
+                        const byte* input = source.data + (slice + z) * slice_bytes + row * row_bytes + column * format.bytes_per_block;
+                        byte* output = staging.cpu + z * packed_slice_bytes;
+                        if (part_columns == columns)
+                        {
+                            memcpy(output, input, size_t(packed_slice_bytes));
+                        }
+                        else
+                        {
+                            for (uint32 y = 0; y < part_rows; ++y)
+                                memcpy(output + y * packed_row_bytes, input + y * row_bytes, size_t(packed_row_bytes));
+                        }
+                    }
+                }
+                copy_memory_to_texture(queue.begin(), gpu_range(staging), destination, part);
+                ++queue.state_.operation_count;
             }
-            ++row;
         }
-        ++slice;
     }
 }
 

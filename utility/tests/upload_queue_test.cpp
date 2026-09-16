@@ -5,7 +5,11 @@
 #endif
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#if defined(_MSC_VER) && !defined(NDEBUG)
+#include <crtdbg.h>
+#endif
 
 using namespace gpu;
 
@@ -187,6 +191,7 @@ static bool initialize(Fixture& fixture)
 
 static void read_results(Fixture& fixture)
 {
+    const TimelinePoint uploaded = fixture.ring.flush();
     fixture.ring.wait();
     memset(fixture.readback.range.cpu, 0xa5, readback_bytes);
     CommandBuffer* commands = begin_commands(fixture.pool);
@@ -199,7 +204,8 @@ static void read_results(Fixture& fixture)
     }
     barrier(commands, Stage::transfer, Access::transfer_write, Stage::host, Access::host_read);
     end_commands(commands);
-    submit(fixture.device, {.commands = {commands}, .completion = {.semaphore = fixture.completion.semaphore, .value = ++fixture.completion.value}});
+    submit(fixture.device, {.commands = {commands}, .waits = {&uploaded, uploaded.semaphore ? 1u : 0u},
+        .completion = {.semaphore = fixture.completion.semaphore, .value = ++fixture.completion.value}});
     wait_timeline(fixture.completion);
     reset_command_pool(fixture.pool);
     check(memcmp(fixture.expected, fixture.readback.range.cpu, readback_bytes) == 0, "all buffer/texture bytes and readback sentinels match");
@@ -411,10 +417,23 @@ static void run_attachment_consumers(Fixture& fixture)
     read_results(fixture);
 }
 
-#if defined(NOGRAPHICSAPI_UPLOAD_QUEUE_SPV_PATH)
-static void run_compute_callbacks(Fixture& fixture)
+static void order_queue(Fixture& fixture, uint32 queue_index)
 {
-    fixture.ring = UploadQueue(fixture.device, 272);
+    CommandPool* pool = create_command_pool(fixture.device, queue_index);
+    CommandBuffer* commands = begin_commands(pool);
+    end_commands(commands);
+    const TimelinePoint previous = fixture.completion;
+    ++fixture.completion.value;
+    submit(fixture.device, {.commands = {commands}, .waits = {previous}, .completion = fixture.completion}, queue_index);
+    wait_timeline(fixture.completion);
+    destroy_command_pool(pool);
+}
+
+#if defined(NOGRAPHICSAPI_UPLOAD_QUEUE_SPV_PATH)
+static void run_compute_callbacks(Fixture& fixture, uint32 queue_index = 0)
+{
+    fixture.ring = UploadQueue(fixture.device, 272, queue_index);
+    order_queue(fixture, queue_index);
     uint32 initial[16]{};
     for (uint32 index = 0; index < 16; ++index) initial[index] = index * 23 + 7;
     memcpy(fixture.expected + guard_bytes, initial, sizeof(initial));
@@ -469,7 +488,7 @@ static void run_compute_callbacks(Fixture& fixture)
 }
 #endif
 
-static void run_multiple_queues(Fixture& fixture)
+static void run_multiple_queues(Fixture& fixture, uint32 queue_index = 1)
 {
     if (get_device_caps(fixture.device).queue_count < 2)
     {
@@ -477,7 +496,8 @@ static void run_multiple_queues(Fixture& fixture)
         return;
     }
     fixture.ring.destroy();
-    UploadQueue original(fixture.device, 256, 1);
+    UploadQueue original(fixture.device, 256, queue_index);
+    order_queue(fixture, queue_index);
     TimelinePoint pending = original.flush();
     ++pending.value;
     uint32 values[64]{};
@@ -494,7 +514,7 @@ static void run_multiple_queues(Fixture& fixture)
         {.gpu = fixture.readback.range.gpu + guard_bytes, .size = sizeof(values)});
     barrier(consumer, Stage::transfer, Access::transfer_write, Stage::host, Access::host_read);
     end_commands(consumer);
-    // Queue zero waits first, so the moved uploader must retain queue one to make progress.
+    // Queue zero waits first, so the moved uploader must retain its nonzero queue to make progress.
     submit(fixture.device, {.commands = {consumer}, .waits = {pending},
         .completion = {.semaphore = fixture.completion.semaphore, .value = ++fixture.completion.value}});
     const TimelinePoint uploaded = fixture.ring.flush();
@@ -548,9 +568,32 @@ static void run_retirement_capacity(Fixture& fixture)
     read_results(fixture);
 }
 
-int main()
+static void run_queue_textures(Fixture& fixture, uint32 queue_index)
 {
-    const DeviceInit initialized = create_device({.desired_queue_count = 2, .timestamp_query_count = 2});
+    fixture.ring = UploadQueue(fixture.device, 8192, queue_index);
+    order_queue(fixture, queue_index);
+    for (uint32 index = 0; index < fixture.case_count; ++index)
+    {
+        const TextureCase& item = fixture.cases[index];
+        if (item.texture == 5) continue; // Depth copies require a general queue.
+        for (uint32 byte = 0; byte < item.bytes; ++byte) fixture.expected[item.offset + byte] ^= uint8(queue_index * 17 + 53);
+        upload_texture(fixture.ring, fixture.textures[item.texture], fixture.descriptions[item.texture],
+            {fixture.expected + item.offset, item.bytes}, {.mip_level = item.mip, .base_slice = item.face, .slice_count = item.texture == 3 ? 1u : 0u});
+    }
+    read_results(fixture);
+    check(fixture.ring.stats().peak_bytes <= 8192, "dedicated queue texture uploads retain bounded staging storage");
+}
+
+int main(int argc, char** argv)
+{
+#if defined(_MSC_VER) && !defined(NDEBUG)
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+    const bool queue_families = argc == 2 && strcmp(argv[1], "--queue-families") == 0;
+    const DeviceInit initialized = create_device({.desired_queue_count = 2, .desired_compute_queue_count = queue_families ? 1u : 0u,
+        .desired_copy_queue_count = queue_families ? 1u : 0u, .timestamp_query_count = 2});
     if (initialized.error != Error::none)
     {
         fprintf(stderr, "No compatible Vulkan device: %u\n", uint32(initialized.error));
@@ -571,6 +614,17 @@ int main()
 #endif
     run_retirement_capacity(fixture);
     run_multiple_queues(fixture);
+    if (queue_families)
+    {
+        const DeviceCaps& caps = get_device_caps(fixture.device);
+        run_multiple_queues(fixture, caps.general_queue_count);
+        run_queue_textures(fixture, caps.general_queue_count);
+#if defined(NOGRAPHICSAPI_UPLOAD_QUEUE_SPV_PATH)
+        run_compute_callbacks(fixture, caps.general_queue_count);
+#endif
+        run_multiple_queues(fixture, caps.general_queue_count + caps.compute_queue_count);
+        run_queue_textures(fixture, caps.general_queue_count + caps.compute_queue_count);
+    }
     shutdown(fixture);
     printf("Upload queue: %u failures.\n", failures);
     return failures ? 1 : 0;

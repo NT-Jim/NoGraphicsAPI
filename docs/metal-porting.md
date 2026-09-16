@@ -294,8 +294,10 @@ descriptions, barriers, or command submission.
 
 ## Deliberate scope
 
-The port must preserve the existing API's multiple general queues, independent command pools,
-and externally synchronized queue operations. It adds no public sparse resources, ray tracing, command graphs,
+The port must preserve indexed general, compute, and copy queues, independent command pools,
+and externally synchronized queue operations. Queue counts describe the roles requested by the application;
+whether Metal exposes independently scheduled engines for those roles remains a porting question.
+It adds no public sparse resources, ray tracing, command graphs,
 queries, pipeline cache, transient-alias activation, or legacy Metal path. Such features need their
 own cross-backend contracts rather than Metal-only escape hatches.
 

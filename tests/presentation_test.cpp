@@ -1,6 +1,7 @@
 #include <NoGraphicsAPI/NoGraphicsAPI.hpp>
 
 #include <stdio.h>
+#include <string.h>
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -25,8 +26,9 @@ void pump_messages() noexcept
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
+    const bool queue_families = argc == 2 && strcmp(argv[1], "--queue-families") == 0;
     const WNDCLASSEXA window_class{
         .cbSize = sizeof(WNDCLASSEXA),
         .lpfnWndProc = DefWindowProcA,
@@ -51,6 +53,8 @@ int main()
         .window = window,
         .swapchain_format = gpu::Format::bgra8_srgb,
         .desired_queue_count = 2,
+        .desired_compute_queue_count = queue_families ? 1u : 0u,
+        .desired_copy_queue_count = queue_families ? 1u : 0u,
     });
     if (device_init.error != gpu::Error::none)
     {

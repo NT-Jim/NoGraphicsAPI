@@ -18,14 +18,26 @@ constexpr Access gpu_access = Access::shader_read | Access::shader_write | Acces
 UploadQueue::UploadQueue(Device* device, uint64 capacity, uint32 queue_index) noexcept
 {
     assert(device && capacity >= alignment && capacity % alignment == 0);
-    assert(queue_index < get_device_caps(device).queue_count);
+    const DeviceCaps& caps = get_device_caps(device);
+    assert(queue_index < caps.queue_count);
     state_.device = device;
     state_.queue_index = queue_index;
+    if (queue_index < caps.general_queue_count + caps.compute_queue_count)
+    {
+        state_.upload_stages = state_.upload_stages | Stage::compute;
+        state_.upload_access = state_.upload_access | Access::shader_read | Access::shader_write | Access::descriptor_read;
+        state_.queue_access = state_.upload_access | Access::indirect_read;
+        if (queue_index < caps.general_queue_count) state_.queue_access = gpu_access;
+    }
+    else
+    {
+        state_.texture_granularity = caps.copy_texture_granularity;
+    }
     state_.heap = create_gpu_heap(device, capacity, MemoryType::cpu_visible);
     state_.completion.semaphore = create_timeline_semaphore(device);
     for (Batch& batch : state_.batches)
     {
-        batch.pool = create_command_pool(device);
+        batch.pool = create_command_pool(device, queue_index);
         end_commands(begin_commands(batch.pool));
         reset_command_pool(batch.pool);
     }
@@ -127,8 +139,7 @@ CommandBuffer* UploadQueue::begin() noexcept
             if (state.retirement_count == retirement_capacity) wait_oldest();
         }
         state.commands = begin_commands(state.batches[(state.retirement_first + state.retirement_count) % retirement_capacity].pool);
-        barrier(state.commands, Stage::all_commands, gpu_access, Stage::transfer | Stage::compute,
-                Access::transfer_write | Access::shader_read | Access::shader_write | Access::descriptor_read);
+        barrier(state.commands, Stage::all_commands, state.queue_access, state.upload_stages, state.upload_access);
     }
     return state.commands;
 }
@@ -158,6 +169,7 @@ void UploadQueue::upload_texture(Texture* destination, ByteSpan source, const Te
 
 GpuCpuRange<byte> UploadQueue::begin_compute(uint64 byte_size) noexcept
 {
+    assert(state_.upload_stages != Stage::transfer && "compute uploads require a general or compute queue");
     const GpuCpuRange<byte> staging = reserve(byte_size);
     barrier(begin(), Stage::transfer | Stage::compute, Access::transfer_write | Access::shader_write,
             Stage::compute, Access::shader_read | Access::shader_write | Access::descriptor_read);
@@ -185,7 +197,7 @@ TimelinePoint UploadQueue::flush() noexcept
     assert(!state.in_callback);
     if (!state.commands) return state.completion;
     reclaim();
-    barrier(state.commands, Stage::transfer | Stage::compute, Access::transfer_write | Access::shader_write, Stage::all_commands, gpu_access);
+    barrier(state.commands, state.upload_stages, state.upload_access, Stage::all_commands, state.queue_access);
     end_commands(state.commands);
     ++state.completion.value;
     submit(state.device, {.commands = {state.commands}, .completion = state.completion}, state.queue_index);

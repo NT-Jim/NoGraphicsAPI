@@ -43,7 +43,7 @@ public:
     void upload_texture(Texture* destination, ByteSpan source, const TextureCopyDesc& copy = {}) noexcept;
 
     // Reserves byte_size (1..capacity), then invokes callback(commands, staging) synchronously with 16-byte-aligned CPU/GPU addresses.
-    // Fill staging and record compute work using ordinary command APIs. The reservation remains occupied until its submission completes.
+    // Requires a general or compute queue. Fill staging and record compute work; the reservation remains occupied until submission completes.
     // The callback must not mutate the uploader or end/submit/retain its command buffer. Staging cannot be used by later submissions.
     // Bind required pipeline/heaps and record dependencies between dispatches inside the callback.
     template<typename Callback>
@@ -64,6 +64,9 @@ public:
     [[nodiscard]] UploadQueueStats stats() const noexcept;
 
 private:
+    friend void upload_texture(UploadQueue& queue, Texture* destination, const TextureDesc& description,
+                               ByteSpan source, const TextureCopyDesc& copy) noexcept;
+
     struct Batch
     {
         CommandPool* pool = nullptr;
@@ -81,6 +84,10 @@ private:
         uint64 tail = 0;
         Batch batches[retirement_capacity]{};
         uint32 queue_index = 0;
+        Stage upload_stages = Stage::transfer;
+        Access upload_access = Access::transfer_read | Access::transfer_write;
+        Access queue_access = Access::transfer_read | Access::transfer_write;
+        uint32x3 texture_granularity = {.x = 1, .y = 1, .z = 1};
         uint32 retirement_first = 0;
         uint32 retirement_count = 0;
         uint32 operation_count = 0;

@@ -36,6 +36,7 @@ constexpr uint32 max_instance_extensions = 256;
 constexpr uint32 max_instance_layers = 64;
 constexpr uint32 max_physical_devices = 32;
 constexpr uint32 max_queue_families = 64;
+constexpr uint32 queue_type_count = 3; // General, compute-only, copy-only.
 constexpr uint32 max_color_attachments = 8;
 constexpr uint32 max_swapchain_images = 8;
 constexpr VkPresentModeKHR swapchain_present_mode = VK_PRESENT_MODE_FIFO_KHR;
@@ -591,6 +592,7 @@ namespace detail
 struct Queue
 {
     VkQueue queue = VK_NULL_HANDLE;
+    uint32 family_index = 0;
     VkCommandBufferSubmitInfo* command_submit_infos = nullptr;
     size_t command_submit_capacity = 0;
     VkSemaphoreSubmitInfo* wait_submit_infos = nullptr;
@@ -618,7 +620,8 @@ struct Device
     detail::Queue* queues = nullptr;
     uint32 queue_count = 0;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
-    uint32 queue_family = 0;
+    uint32 queue_families[queue_type_count]{};
+    uint32 queue_family_count = 0;
     uint32 timestamp_query_count = 0;
     VkPhysicalDeviceMemoryProperties memory_properties{};
     VkPhysicalDeviceProperties physical_properties{};
@@ -697,7 +700,9 @@ struct Device
             .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = size,
             .usage = usage,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .sharingMode = queue_family_count > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = queue_family_count,
+            .pQueueFamilyIndices = queue_families,
         };
         require_vk(vkCreateBuffer(device, &buffer_info, nullptr, &result.buffer));
 
@@ -762,7 +767,9 @@ VkMemoryRequirements buffer_memory_requirements(Device& device, VkBufferUsageFla
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = 1,
         .usage = usage,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .sharingMode = device.queue_family_count > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = device.queue_family_count,
+        .pQueueFamilyIndices = device.queue_families,
     };
     const VkDeviceBufferMemoryRequirements requirements_info{
         .sType = VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS,
@@ -862,7 +869,9 @@ bool select_texture_memory_type(Device& device) noexcept
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = color_usage,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .sharingMode = device.queue_family_count > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = device.queue_family_count,
+        .pQueueFamilyIndices = device.queue_families,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
     if (!supports_image_create_info(device, image_info))
@@ -1373,8 +1382,9 @@ struct QueriedFeatures
 struct Candidate
 {
     VkPhysicalDevice physical_device = VK_NULL_HANDLE;
-    uint32 queue_family = 0;
-    uint32 queue_count = 0;
+    uint32 queue_families[queue_type_count]{};
+    uint32 queue_counts[queue_type_count]{};
+    uint32x3 copy_texture_granularity = {.x = 1, .y = 1, .z = 1};
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memory_properties{};
     bool unified_image_layouts = false;
@@ -1389,7 +1399,7 @@ struct Candidate
 };
 
 Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, bool khr_surface_maintenance1, bool ext_surface_maintenance1,
-                        Candidate& output) noexcept
+                        const DeviceDesc& desc, Candidate& output) noexcept
 {
     VkExtensionProperties extensions[max_device_extensions]{};
     uint32 extension_count = 0;
@@ -1498,15 +1508,32 @@ Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, 
     VkQueueFamilyProperties queues[max_queue_families]{};
     uint32 queue_count = available_queue_count;
     vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_count, queues);
-    uint32 queue_family = queue_count;
-    constexpr VkQueueFlags required_queue_flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT;
     for (uint32 index = 0; index < queue_count; ++index)
     {
-        if (queues[index].queueCount == 0 || queues[index].timestampValidBits != 64 ||
-            (queues[index].queueFlags & required_queue_flags) != required_queue_flags)
+        if (queues[index].queueCount == 0 || queues[index].timestampValidBits != 64)
             continue;
+        const VkQueueFlags flags = queues[index].queueFlags;
+        uint32 type = 0;
+        if (flags & VK_QUEUE_GRAPHICS_BIT)
+        {
+            if (!(flags & VK_QUEUE_COMPUTE_BIT)) continue;
+        }
+        else if (flags & VK_QUEUE_COMPUTE_BIT)
+        {
+            type = 1;
+        }
+        else if ((flags & VK_QUEUE_TRANSFER_BIT) &&
+                 !(flags & ~(VK_QUEUE_TRANSFER_BIT | VK_QUEUE_SPARSE_BINDING_BIT | VK_QUEUE_PROTECTED_BIT)))
+        {
+            type = 2;
+        }
+        else
+        {
+            continue;
+        }
+        if (result.queue_counts[type] != 0) continue;
         VkBool32 presentation_supported = VK_TRUE;
-        if (surface)
+        if (surface && type == 0)
         {
             const Error presentation_error = error_from_vk(vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, index, surface, &presentation_supported));
             if (presentation_error != Error::none)
@@ -1514,15 +1541,22 @@ Error inspect_candidate(VkPhysicalDevice physical_device, VkSurfaceKHR surface, 
         }
         if (presentation_supported == VK_TRUE)
         {
-            queue_family = index;
-            break;
+            result.queue_families[type] = index;
+            result.queue_counts[type] = queues[index].queueCount;
+            if (type == 2)
+            {
+                result.copy_texture_granularity = {
+                    .x = queues[index].minImageTransferGranularity.width,
+                    .y = queues[index].minImageTransferGranularity.height,
+                    .z = queues[index].minImageTransferGranularity.depth,
+                };
+            }
         }
     }
-    if (queue_family == queue_count)
+    if (result.queue_counts[0] == 0 || (desc.desired_compute_queue_count && result.queue_counts[1] == 0) ||
+        (desc.desired_copy_queue_count && result.queue_counts[2] == 0))
         return Error::unsupported;
 
-    result.queue_family = queue_family;
-    result.queue_count = queues[queue_family].queueCount;
     output = result;
     return Error::none;
 }
@@ -1692,7 +1726,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     {
         const VkPhysicalDevice physical_device = physical_devices[index];
         Candidate candidate{};
-        error = inspect_candidate(physical_device, state->surface, khr_surface_maintenance1, ext_surface_maintenance1, candidate);
+        error = inspect_candidate(physical_device, state->surface, khr_surface_maintenance1, ext_surface_maintenance1, desc, candidate);
         if (error == Error::unsupported)
             continue;
         if (error != Error::none)
@@ -1709,7 +1743,6 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
         return fail_device_creation(state, Error::unsupported);
 
     state->physical_device = selected.physical_device;
-    state->queue_family = selected.queue_family;
     state->physical_properties = selected.properties;
     state->heap_properties = selected.heap_properties;
     state->max_timeline_value_difference = selected.vulkan12_properties.maxTimelineSemaphoreValueDifference;
@@ -1758,17 +1791,31 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     enabled_features.mesh_shader.meshShader = VK_TRUE;
     enabled_features.swapchain_maintenance1.swapchainMaintenance1 = VK_TRUE;
 
-    state->queue_count = desc.desired_queue_count < selected.queue_count ? desc.desired_queue_count : selected.queue_count;
+    const uint32 requested_counts[]{desc.desired_queue_count, desc.desired_compute_queue_count, desc.desired_copy_queue_count};
+    uint32 queue_counts[queue_type_count]{};
+    for (uint32 type = 0; type < queue_type_count; ++type)
+    {
+        queue_counts[type] = requested_counts[type] < selected.queue_counts[type] ? requested_counts[type] : selected.queue_counts[type];
+        state->queue_count += queue_counts[type];
+    }
     state->queues = new detail::Queue[state->queue_count];
     float* queue_priorities = new float[state->queue_count];
     for (uint32 index = 0; index < state->queue_count; ++index)
         queue_priorities[index] = 1.0f;
-    const VkDeviceQueueCreateInfo queue_info{
-        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .queueFamilyIndex = state->queue_family,
-        .queueCount = state->queue_count,
-        .pQueuePriorities = queue_priorities,
-    };
+    VkDeviceQueueCreateInfo queue_infos[queue_type_count]{};
+    uint32 first_queue = 0;
+    for (uint32 type = 0; type < queue_type_count; ++type)
+    {
+        if (queue_counts[type] == 0) continue;
+        state->queue_families[state->queue_family_count] = selected.queue_families[type];
+        queue_infos[state->queue_family_count++] = {
+            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .queueFamilyIndex = selected.queue_families[type],
+            .queueCount = queue_counts[type],
+            .pQueuePriorities = queue_priorities + first_queue,
+        };
+        first_queue += queue_counts[type];
+    }
     const char* enabled_device_extensions[7]{};
     uint32 enabled_device_extension_count = 0;
     enabled_device_extensions[enabled_device_extension_count++] = VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME;
@@ -1791,8 +1838,8 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     const VkDeviceCreateInfo device_info{
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &enabled_features.core,
-        .queueCreateInfoCount = 1,
-        .pQueueCreateInfos = &queue_info,
+        .queueCreateInfoCount = state->queue_family_count,
+        .pQueueCreateInfos = queue_infos,
         .enabledExtensionCount = enabled_device_extension_count,
         .ppEnabledExtensionNames = enabled_device_extensions,
     };
@@ -1800,8 +1847,16 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     delete[] queue_priorities;
     if (error != Error::none)
         return fail_device_creation(state, error);
-    for (uint32 index = 0; index < state->queue_count; ++index)
-        vkGetDeviceQueue(state->device, state->queue_family, index, &state->queues[index].queue);
+    first_queue = 0;
+    for (uint32 type = 0; type < queue_type_count; ++type)
+    {
+        for (uint32 index = 0; index < queue_counts[type]; ++index)
+        {
+            detail::Queue& queue = state->queues[first_queue++];
+            queue.family_index = selected.queue_families[type];
+            vkGetDeviceQueue(state->device, queue.family_index, index, &queue.queue);
+        }
+    }
     if (!supports_gpu_heap_memory(*state) || !select_texture_memory_type(*state))
         return fail_device_creation(state, Error::unsupported);
 
@@ -1856,6 +1911,10 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     state->caps = {
         .device_name = state->physical_properties.deviceName,
         .queue_count = state->queue_count,
+        .general_queue_count = queue_counts[0],
+        .compute_queue_count = queue_counts[1],
+        .copy_queue_count = queue_counts[2],
+        .copy_texture_granularity = selected.copy_texture_granularity,
         .max_push_data_size = state->heap_properties.maxPushDataSize,
         .texture_heap_alignment = state->texture_heap_alignment,
         .texture_descriptor_size = state->heap_properties.imageDescriptorSize,
@@ -2154,7 +2213,9 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
         .imageExtent = extent,
         .imageArrayLayers = 1,
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-        .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .imageSharingMode = device.queue_family_count > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = device.queue_family_count,
+        .pQueueFamilyIndices = device.queue_families,
         .preTransform = capabilities.currentTransform,
         .compositeAlpha = composite_alpha,
         .presentMode = swapchain_present_mode,
@@ -2410,7 +2471,9 @@ void prepare_texture(Device& device, const TextureDesc& desc, PreparedTexture& o
         .samples = VK_SAMPLE_COUNT_1_BIT,
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = usage,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .sharingMode = device.queue_family_count > 1 ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE,
+        .queueFamilyIndexCount = device.queue_family_count,
+        .pQueueFamilyIndices = device.queue_families,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
     };
 }
@@ -2821,14 +2884,14 @@ void destroy_pso(PSO* pso) noexcept
     delete pso;
 }
 
-CommandPool* create_command_pool(Device* device) noexcept
+CommandPool* create_command_pool(Device* device, uint32 queue_index) noexcept
 {
-    assert(device && "create_command_pool called with a null device");
+    assert(device && queue_index < device->queue_count && "create_command_pool requires an available queue index");
     CommandPool* pool = new CommandPool{.state = device};
     const VkCommandPoolCreateInfo pool_info{
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-        .queueFamilyIndex = device->queue_family,
+        .queueFamilyIndex = device->queues[queue_index].family_index,
     };
     require_vk(vkCreateCommandPool(device->device, &pool_info, nullptr, &pool->command_pool));
     return pool;

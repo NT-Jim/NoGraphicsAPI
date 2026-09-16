@@ -234,12 +234,20 @@ before submitting any subset to a selected queue. Other pools can continue recor
 Reset a pool only after all its submitted work completes; reset discards unsubmitted work and invalidates
 its command-buffer handles. Pools retain storage for reuse until destruction.
 
-Device creation requests a queue count, capped to the selected graphics + compute family's capacity.
-All exposed queues share that family, so resources need no queue-family ownership transfers.
+Device creation requests general, compute-only, and copy-only queue counts, each capped to its family's capacity.
+A nonzero request requires a matching family; queue indices run general first, then compute, then copy.
+`DeviceCaps` reports the actual counts. `create_command_pool(device, queue_index)` selects the recording family;
+submit its command buffers only to queues in that family. Queue zero remains the general/presentation queue.
+All buffers, textures, and swapchain images use concurrent sharing across the enabled families, so ownership
+transfers are unnecessary. With only one family, Vulkan's exclusive mode already covers all its queues.
 `submit(device, desc, queue_index)` selects a queue by index and defaults to zero.
 Submission accepts timeline waits covering all command stages and signals the caller's completion point.
 Use waits for cross-queue hazards; an ordinary barrier only synchronizes work on its own queue.
 Prefer one signaling timeline per queue, or explicitly order signals to a shared timeline.
+
+Copy-only texture transfers follow `DeviceCaps::copy_texture_granularity`; depth/stencil copies require a general queue.
+`UploadQueue` accepts any queue index. Its tightly packed texture helper respects copy granularity, provided staging
+fits one granularity block at the mip edge. Compute upload callbacks require a general or compute queue.
 
 Each `(device, queue_index)` and command pool is externally synchronized, including command recording within the pool.
 Distinct resource creation, immutable queries, timeline waits, and descriptor writes to disjoint slots
