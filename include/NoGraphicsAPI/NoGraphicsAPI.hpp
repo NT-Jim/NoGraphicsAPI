@@ -448,6 +448,7 @@ struct DeviceDesc
     Format swapchain_format = Format::undefined;
     uint32 desired_swapchain_image_count = 2; // 1..8 presentation contexts.
     uint32 timestamp_query_count = 256; // Per command buffer; zero disables timestamps.
+    bool vsync = true; // true: FIFO. false: prefer mailbox, else immediate, else FIFO.
 };
 
 struct DeviceInit
@@ -471,6 +472,7 @@ struct TextureDesc
     Format format = Format::rgba8_unorm;
     bool mutable_format = false; // Allow format-compatible descriptor views, but could lose DCC.
     TextureUsage usage = TextureUsage::sampled;
+    uint32 sample_count = 1; // MSAA sample count (1, 2, 4, 8). >1 requires an attachment usage and one mip level.
 };
 
 struct RenderViewDesc
@@ -589,6 +591,7 @@ struct GraphicsPSODesc
     Format depth_format = Format::undefined;
     Format stencil_format = Format::undefined;
     RasterizationState rasterization = {};
+    uint32 sample_count = 1; // MSAA samples; must match the render pass attachments' sample count.
 };
 
 struct MeshPSODesc
@@ -600,6 +603,7 @@ struct MeshPSODesc
     Format depth_format = Format::undefined;
     Format stencil_format = Format::undefined;
     RasterizationState rasterization = {};
+    uint32 sample_count = 1; // MSAA samples; must match the render pass attachments' sample count.
 };
 
 struct ClearColor
@@ -616,6 +620,10 @@ struct ColorAttachment
     LoadOp load = LoadOp::load;
     StoreOp store = StoreOp::store;
     ClearColor clear = {};
+    // When set, a multisampled render_view resolves (averaged) into this
+    // single-sample view at the end of the pass. Its store op still applies to
+    // render_view; use StoreOp::discard there to keep only the resolved result.
+    RenderView* resolve_view = nullptr;
 };
 
 struct DepthAttachment
@@ -647,6 +655,9 @@ struct RenderingDesc
 // Wait for all submitted frames to drain before destroying the device.
 [[nodiscard]] DeviceInit create_device(const DeviceDesc& desc = {}) noexcept;
 void destroy_device(Device* device) noexcept;
+// Change the swapchain present mode at runtime (recreates the swapchain). No
+// frame may be acquired and the device must be idle. See DeviceDesc::vsync.
+void set_vsync(Device* device, bool vsync) noexcept;
 [[nodiscard]] const DeviceCaps& get_device_caps(const Device* device) noexcept;
 [[nodiscard]] bool supports_texture_format(const Device* device, Format format, TextureUsage usage) noexcept;
 [[nodiscard]] uint32x2 get_drawable_extent(Device* device) noexcept;

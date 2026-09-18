@@ -40,7 +40,6 @@ constexpr uint32 max_color_attachments = 8;
 constexpr uint32 image_barrier_batch_size = 64;
 constexpr uint32 initial_command_context_count = 2;
 constexpr uint32 max_swapchain_images = 8;
-constexpr VkPresentModeKHR swapchain_present_mode = VK_PRESENT_MODE_FIFO_KHR;
 constexpr uint32 gpu_allocation_alignment = 16;
 constexpr uint32 max_surface_formats = 64;
 constexpr uint32 format_count = static_cast<uint32>(Format::undefined);
@@ -648,6 +647,7 @@ struct Device
     VkDevice device = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
+    VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
     uint32 queue_family = 0;
     uint32 timestamp_query_count = 0;
     VkPhysicalDeviceMemoryProperties memory_properties{};
@@ -1431,6 +1431,7 @@ struct Texture
     uint32 height = 0;
     uint32 depth = 0;
     uint32 layer_count = 0;
+    uint32 sample_count = 1;
     TextureType type = TextureType::two_d;
     Format format = Format::rgba8_unorm;
     detail::TextureInitialization initialization;
@@ -1448,6 +1449,7 @@ struct RenderView
     VkImageView view = VK_NULL_HANDLE;
     uint32 width = 0;
     uint32 height = 0;
+    uint32 sample_count = 1;
     bool swapchain_view = false;
 };
 
@@ -1737,6 +1739,33 @@ DeviceInit fail_device_creation(Device* device, Error error) noexcept
 }
 
 Error recreate_swapchain(Swapchain& swapchain) noexcept;
+
+// FIFO (vsync) is always supported. When vsync is off, prefer mailbox (uncapped,
+// no tearing), then immediate (uncapped, may tear), else fall back to FIFO.
+VkPresentModeKHR choose_present_mode(VkPhysicalDevice physical_device, VkSurfaceKHR surface, bool vsync) noexcept
+{
+    if (vsync)
+        return VK_PRESENT_MODE_FIFO_KHR;
+
+    uint32 count = 0;
+    if (vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &count, nullptr) != VK_SUCCESS)
+        return VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR modes[8]{};
+    if (count > 8)
+        count = 8;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &count, modes);
+
+    bool mailbox = false;
+    bool immediate = false;
+    for (uint32 index = 0; index < count; ++index)
+    {
+        if (modes[index] == VK_PRESENT_MODE_MAILBOX_KHR) mailbox = true;
+        if (modes[index] == VK_PRESENT_MODE_IMMEDIATE_KHR) immediate = true;
+    }
+    if (mailbox) return VK_PRESENT_MODE_MAILBOX_KHR;
+    if (immediate) return VK_PRESENT_MODE_IMMEDIATE_KHR;
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
 
 } // namespace
 
@@ -2042,6 +2071,7 @@ DeviceInit create_device(const DeviceDesc& desc) noexcept
     };
     if (presentation)
     {
+        state->present_mode = choose_present_mode(state->physical_device, state->surface, desc.vsync);
         state->swapchain = new Swapchain;
         state->swapchain->state = state;
         state->swapchain->format = desc.swapchain_format;
@@ -2253,7 +2283,7 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
     assert(!swapchain.acquired && !device.acquired_swapchain && device.active_command_buffers == 0);
     const VkSurfacePresentModeKHR present_mode_info{
         .sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR,
-        .presentMode = swapchain_present_mode,
+        .presentMode = device.present_mode,
     };
     const VkPhysicalDeviceSurfaceInfo2KHR surface_info{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
@@ -2319,7 +2349,7 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
     const VkSwapchainPresentModesCreateInfoKHR present_modes_info{
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR,
         .presentModeCount = 1,
-        .pPresentModes = &swapchain_present_mode,
+        .pPresentModes = &device.present_mode,
     };
     const VkSwapchainCreateInfoKHR create_info{
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
@@ -2334,7 +2364,7 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .preTransform = capabilities.currentTransform,
         .compositeAlpha = composite_alpha,
-        .presentMode = swapchain_present_mode,
+        .presentMode = device.present_mode,
         .clipped = VK_TRUE,
         .oldSwapchain = old_handle,
     };
@@ -2413,6 +2443,20 @@ Error recreate_swapchain(Swapchain& swapchain) noexcept
 }
 
 } // namespace
+
+void set_vsync(Device* device, bool vsync) noexcept
+{
+    assert(device && "set_vsync called with a null device");
+    if (!device->swapchain)
+        return;
+    const VkPresentModeKHR mode = choose_present_mode(device->physical_device, device->surface, vsync);
+    if (mode == device->present_mode)
+        return;
+    assert(!device->acquired_swapchain && device->active_command_buffers == 0 &&
+           "set_vsync requires an idle device with no acquired frame");
+    device->present_mode = mode;
+    (void)recreate_swapchain(*device->swapchain);
+}
 
 uint32x2 get_drawable_extent(Device* device) noexcept
 {
@@ -2515,6 +2559,20 @@ struct PreparedTexture
     };
 };
 
+VkSampleCountFlagBits to_vk_sample_count(uint32 samples) noexcept
+{
+    switch (samples)
+    {
+    case 1: return VK_SAMPLE_COUNT_1_BIT;
+    case 2: return VK_SAMPLE_COUNT_2_BIT;
+    case 4: return VK_SAMPLE_COUNT_4_BIT;
+    case 8: return VK_SAMPLE_COUNT_8_BIT;
+    default: break;
+    }
+    assert(false && "unsupported MSAA sample count (use 1, 2, 4, or 8)");
+    return VK_SAMPLE_COUNT_1_BIT;
+}
+
 void prepare_texture(Device& device, const TextureDesc& desc, PreparedTexture& output) noexcept
 {
     output = {};
@@ -2568,7 +2626,7 @@ void prepare_texture(Device& device, const TextureDesc& desc, PreparedTexture& o
         },
         .mipLevels = desc.mip_levels,
         .arrayLayers = desc.layer_count,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .samples = to_vk_sample_count(desc.sample_count),
         .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = usage,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -2629,6 +2687,7 @@ Texture* create_texture(Device* device, const TextureDesc& desc, const TextureHe
         .height = desc.extent.y,
         .depth = desc.extent.z,
         .layer_count = desc.layer_count,
+        .sample_count = desc.sample_count,
         .type = desc.type,
         .format = desc.format,
     };
@@ -2662,6 +2721,7 @@ RenderView* create_render_view(Texture* texture, const RenderViewDesc& desc) noe
         .state = texture->state,
         .width = width,
         .height = height,
+        .sample_count = texture->sample_count,
     };
     const VkImageViewCreateInfo view_info{
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
@@ -2773,7 +2833,7 @@ namespace
 
 PSO* create_raster_pso(Device* device, Span<const uint32> first_stage_spirv, Span<const uint32> fragment_spirv, Span<const ColorTargetDesc> color_targets,
                        Format depth_format, Format stencil_format, const RasterizationState& rasterization_state,
-                       bool mesh, Span<const uint32> task_spirv = {}) noexcept
+                       bool mesh, uint32 sample_count, Span<const uint32> task_spirv = {}) noexcept
 {
     assert(device && "PSO creation called with a null device");
     assert((color_targets.size == 0 || color_targets.data) && color_targets.size <= max_color_attachments &&
@@ -2839,7 +2899,7 @@ PSO* create_raster_pso(Device* device, Span<const uint32> first_stage_spirv, Spa
     };
     const VkPipelineMultisampleStateCreateInfo multisample{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+        .rasterizationSamples = to_vk_sample_count(sample_count),
     };
     const VkPipelineDepthStencilStateCreateInfo depth_stencil{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
@@ -2926,13 +2986,13 @@ PSO* create_raster_pso(Device* device, Span<const uint32> first_stage_spirv, Spa
 PSO* create_graphics_pso(Device* device, const GraphicsPSODesc& desc) noexcept
 {
     return create_raster_pso(device, desc.vertex_spirv, desc.fragment_spirv, desc.color_targets, desc.depth_format,
-                             desc.stencil_format, desc.rasterization, false);
+                             desc.stencil_format, desc.rasterization, false, desc.sample_count);
 }
 
 PSO* create_mesh_pso(Device* device, const MeshPSODesc& desc) noexcept
 {
     return create_raster_pso(device, desc.mesh_spirv, desc.fragment_spirv, desc.color_targets, desc.depth_format,
-                             desc.stencil_format, desc.rasterization, true, desc.task_spirv);
+                             desc.stencil_format, desc.rasterization, true, desc.sample_count, desc.task_spirv);
 }
 
 PSO* create_compute_pso(Device* device, Span<const uint32> compute_spirv) noexcept
@@ -3440,10 +3500,15 @@ void begin_render_pass(CommandBuffer* commands, const RenderingDesc& desc) noexc
     {
         const ColorAttachment& attachment = desc.colors.data[index];
         assert(attachment.render_view);
+        assert((!attachment.resolve_view || attachment.render_view->sample_count > 1) &&
+               "resolve_view requires a multisampled render_view");
         color_attachments[index] = {
             .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = attachment.render_view->view,
             .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .resolveMode = attachment.resolve_view ? VK_RESOLVE_MODE_AVERAGE_BIT : VK_RESOLVE_MODE_NONE,
+            .resolveImageView = attachment.resolve_view ? attachment.resolve_view->view : VK_NULL_HANDLE,
+            .resolveImageLayout = attachment.resolve_view ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             .loadOp = static_cast<VkAttachmentLoadOp>(attachment.load),
             .storeOp = static_cast<VkAttachmentStoreOp>(attachment.store),
             .clearValue = {
